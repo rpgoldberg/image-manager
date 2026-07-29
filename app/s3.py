@@ -2,8 +2,8 @@ import logging
 from functools import lru_cache
 from typing import Any
 
-import boto3
-from botocore.client import Config
+import boto3  # type: ignore[import-untyped]
+from botocore.client import Config  # type: ignore[import-untyped]
 
 from .config import get_settings
 
@@ -11,8 +11,12 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def get_s3():
-    """Return a cached boto3 S3 client singleton."""
+def get_s3() -> Any:
+    """Return a cached boto3 S3 client singleton.
+
+    Typed ``Any``: boto3 synthesises the S3 client's methods at runtime, so
+    there is no static type to name here without pulling in boto3-stubs.
+    """
     s = get_settings()
     session = boto3.session.Session()
     return session.client(
@@ -36,23 +40,25 @@ def presign_post_for_upload(key: str, *, content_type: str, size: int) -> dict[s
         {"acl": "private"},
     ]
     fields = {"Content-Type": content_type, "acl": "private"}
-    return client.generate_presigned_post(
+    presigned: dict[str, Any] = client.generate_presigned_post(
         Bucket=s.s3_bucket,
         Key=key,
         Fields=fields,
         Conditions=conditions,
         ExpiresIn=s.s3_presign_expiry_post,
     )
+    return presigned
 
 
 def presign_get(key: str, *, expires_in: int | None = None) -> str:
     s = get_settings()
     client = get_s3()
-    return client.generate_presigned_url(
+    url: str = client.generate_presigned_url(
         "get_object",
         Params={"Bucket": s.s3_bucket, "Key": key},
         ExpiresIn=expires_in or s.s3_presign_expiry_get,
     )
+    return url
 
 
 def move_object(src_key: str, dest_key: str) -> None:
@@ -60,4 +66,3 @@ def move_object(src_key: str, dest_key: str) -> None:
     client = get_s3()
     client.copy({"Bucket": s.s3_bucket, "Key": src_key}, s.s3_bucket, dest_key)
     client.delete_object(Bucket=s.s3_bucket, Key=src_key)
-

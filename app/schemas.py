@@ -1,8 +1,34 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+# ruff: noqa: TCH003 - `dt` must stay a RUNTIME import.  Pydantic resolves field
+# annotations when it builds the model, so moving datetime into a TYPE_CHECKING
+# block leaves every `dt.datetime` field unresolvable and every request body
+# containing one fails to validate.  Verified: doing so breaks 18 tests.
+# FastAPI's `Depends(...)` parameters are different — those annotations are
+# never evaluated, which is why the route modules can and do defer theirs.
+import datetime as dt
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
+
+#: Keys are ``asset.sha256`` now, not ``images.id``.  The wire type carries the
+#: same ``^[0-9a-f]{64}$`` rule the sha256_hex domain does, so a malformed
+#: digest is a 422 at the edge rather than a 500 in the ORM.
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+Visibility = Literal["private", "tenant", "public", "catalog"]
+ContentRating = Literal["all_ages", "teen", "adult", "unknown"]
+SourceClass = Literal[
+    "manufacturer_press", "retailer_studio", "user_photo", "derived_own", "unknown"
+]
+RightsBasis = Literal[
+    "user_licence", "permission_granted", "unlicensed_norm", "own_work", "unknown"
+]
+DepictionRole = Literal["main", "box", "detail", "scale_ref", "user_shelf", "comparison"]
+LayerType = Literal["matte_mask", "occluder", "depth_transform", "watermark"]
+RenderContext = Literal["default", "case_shelf", "detail"]
+CompositeOp = Literal["source-over", "destination-in", "destination-out", "multiply", "screen"]
+Confidence = Literal["high", "medium", "low", "unknown"]
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -20,7 +46,7 @@ class DevTokenResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Images
+# Assets
 # ---------------------------------------------------------------------------
 
 
@@ -39,75 +65,180 @@ class InitiateUploadResponse(BaseModel):
     bucket: str
 
 
+class OriginRequest(BaseModel):
+    """How we came to hold these bytes.
+
+    ``derive_permitted`` defaults FALSE and cannot be set without an
+    affirmative ``rights_basis``; ``permission_granted`` must name the
+    instrument that granted it.
+    """
+
+    source_id: str | None = None
+    source_url: str | None = None
+    capture_id: str | None = None
+    source_class: SourceClass = "unknown"
+    rights_basis: RightsBasis = "unknown"
+    derive_permitted: bool = False
+    permission_ref: str | None = None
+    rights_asserted_by: str | None = None
+    fetched_at: dt.datetime | None = None
+
+
 class CompleteUploadRequest(BaseModel):
-    sha256: str = Field(min_length=64, max_length=64)
+    sha256: Sha256
     key: str
     mime: str
     size: int = Field(gt=0)
+    #: An asset with no origin is audit-invisible.  Uploads default to a
+    #: first-party own-work origin; scrapers must say what they really are.
+    origin: OriginRequest | None = None
 
 
 class CompleteUploadResponse(BaseModel):
-    image_id: int
+    sha256: str
     created: bool
 
 
-class VersionSummary(BaseModel):
-    id: int
-    version_no: int
-    visibility: str
-    age_rating: int
-    alt_for_version_id: int | None = None
-    mime: str | None = None
-    width: int | None = None
-    height: int | None = None
-    bytes: int | None = None
+class OriginSummary(BaseModel):
+    id: str
+    source_id: str | None = None
+    source_url: str | None = None
+    source_class: str
+    rights_basis: str
+    derive_permitted: bool
+    permission_ref: str | None = None
 
 
-class ImageDetailResponse(BaseModel):
-    id: int
+class PresentationSummary(BaseModel):
+    id: str
+    render_context: str
+    layer_type: str
+    layer_asset_sha256: str | None = None
+    z_index: int
+    transform: dict[str, Any]
+    composite_op: str
+    produced_by: str
+
+
+class DeriveStateResponse(BaseModel):
+    """The gate, made legible.  A refusal says which half closed."""
+
     sha256: str
-    mime: str | None = None
+    permission_ok: bool
+    bytes_ok: bool
+    not_suppressed: bool
+    derive_ok: bool
+    reasons: list[str] = []
+
+
+class AssetDetailResponse(BaseModel):
+    sha256: str
+    mime: str
     bytes: int | None = None
     width: int | None = None
     height: int | None = None
-    versions: list[VersionSummary] = []
+    storage_key: str | None = None
+    watermark_state: str
+    cmi_present: bool | None = None
+    content_rating: str
+    derived_from: str | None = None
+    derive_state: DeriveStateResponse
+    origins: list[OriginSummary] = []
+    presentations: list[PresentationSummary] = []
 
 
-class ImageVersionResponse(BaseModel):
-    image_id: int
-    version_id: int
-
-
-class CreateVersionRequest(BaseModel):
-    transform_spec: dict[str, Any] = Field(default_factory=dict)
-    base_version_id: int | None = None
-    visibility: Literal["private", "tenant", "public", "catalog"] = "private"
-    age_rating: int = 0
-    create_safe_alt_for: int | None = None
-
-
-class CreateVersionResponse(BaseModel):
-    version_id: int
-    version_no: int
-    storage_key: str
+class SetContentRatingRequest(BaseModel):
+    content_rating: ContentRating
 
 
 class SetVisibilityRequest(BaseModel):
-    visibility: Literal["private", "tenant", "public", "catalog"]
+    visibility: Visibility
 
 
 class OkResponse(BaseModel):
     ok: bool
 
 
-class ExposeSafeAltRequest(BaseModel):
-    age_rating: int = 0
-    blur_spec: dict[str, Any] | None = None
+# ---------------------------------------------------------------------------
+# Renditions — a technical CACHE, never an expressive edit
+# ---------------------------------------------------------------------------
 
 
-class ExposeSafeAltResponse(BaseModel):
-    version_id: int
-    alt_for: int
+class CreateRenditionRequest(BaseModel):
+    transform: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateRenditionResponse(BaseModel):
+    sha256: str
+    transform_hash: str
+    storage_key: str
+
+
+# ---------------------------------------------------------------------------
+# Presentations — render layers, with a per-layer kill switch
+# ---------------------------------------------------------------------------
+
+
+class CreatePresentationRequest(BaseModel):
+    layer_type: LayerType
+    produced_by: str
+    render_context: RenderContext = "default"
+    layer_asset_sha256: Sha256 | None = None
+    z_index: int = 0
+    transform: dict[str, Any] = Field(default_factory=dict)
+    composite_op: CompositeOp = "source-over"
+
+
+class CreatePresentationResponse(BaseModel):
+    id: str
+
+
+class DisablePresentationRequest(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+class SuppressAssetRequest(BaseModel):
+    reason: str = Field(min_length=1)
+    notice_ref: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Depictions — sourced CLAIMS, not foreign keys
+# ---------------------------------------------------------------------------
+
+
+class CreateDepictionRequest(BaseModel):
+    role: DepictionRole
+    source_id: str | None = None
+    source_native_id: str | None = None
+    subject_product_id: str | None = None
+    product_id: str | None = None
+    alt_text: str | None = None
+    source_url: str | None = None
+    ruleset_version: str | None = None
+    conf: Confidence = "unknown"
+    rank: int | None = None
+    as_of: dt.datetime | None = None
+
+
+class CreateDepictionResponse(BaseModel):
+    id: str
+
+
+class DepictionSummary(BaseModel):
+    id: str
+    asset_sha256: str
+    role: str
+    source_id: str | None = None
+    source_native_id: str | None = None
+    subject_product_id: str | None = None
+    product_id: str | None = None
+    conf: str
+    rank: int | None = None
+
+
+class DepictionListResponse(BaseModel):
+    results: list[DepictionSummary] = []
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +251,11 @@ class CreateAlbumRequest(BaseModel):
     description: str | None = None
     default_visibility: Literal["private", "tenant", "public"] = "private"
     is_shareable: bool = False
-    share_age_threshold: int = 0
+    share_age_threshold: ContentRating = "all_ages"
 
 
 class CreateAlbumResponse(BaseModel):
-    id: int
+    id: str
 
 
 class UpdateAlbumRequest(BaseModel):
@@ -132,12 +263,11 @@ class UpdateAlbumRequest(BaseModel):
     description: str | None = None
     default_visibility: Literal["private", "tenant", "public"] | None = None
     is_shareable: bool | None = None
-    share_age_threshold: int | None = None
+    share_age_threshold: ContentRating | None = None
 
 
 class AddAlbumItemRequest(BaseModel):
-    image_id: int
-    version_id: int | None = None
+    asset_sha256: Sha256
     position: int | None = None
 
 
@@ -156,23 +286,23 @@ class ReorderRequest(BaseModel):
 
 class AlbumItemSummary(BaseModel):
     position: int
-    image_id: int
-    version_id: int | None = None
+    asset_sha256: str
+    item_visibility: str | None = None
 
 
 class AlbumDetailResponse(BaseModel):
-    id: int
+    id: str
     title: str
     description: str | None = None
     default_visibility: str
     is_shareable: bool
-    share_age_threshold: int
+    share_age_threshold: str
     items: list[AlbumItemSummary] = []
 
 
 class ShareAlbumRequest(BaseModel):
     enable: bool
-    share_age_threshold: int | None = None
+    share_age_threshold: ContentRating | None = None
 
 
 class ShareAlbumResponse(BaseModel):
@@ -195,12 +325,12 @@ class CreateTagRequest(BaseModel):
 
 
 class CreateTagResponse(BaseModel):
-    id: int
+    id: str
     name: str
 
 
 class TagItemsRequest(BaseModel):
-    tag_ids: list[int] = []
+    tag_ids: list[str] = []
     names: list[str] = []
 
 
@@ -213,25 +343,24 @@ class TagItemsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ImageSearchResult(BaseModel):
-    id: int
-    mime: str | None = None
+class AssetSearchResult(BaseModel):
     sha256: str
+    mime: str | None = None
 
 
-class ImageSearchResponse(BaseModel):
-    results: list[ImageSearchResult]
-    next_cursor: int | None = None
+class AssetSearchResponse(BaseModel):
+    results: list[AssetSearchResult]
+    next_cursor: str | None = None
 
 
 class AlbumSearchResult(BaseModel):
-    id: int
+    id: str
     title: str
 
 
 class AlbumSearchResponse(BaseModel):
     results: list[AlbumSearchResult]
-    next_cursor: int | None = None
+    next_cursor: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -242,17 +371,15 @@ class AlbumSearchResponse(BaseModel):
 class CreateExternalRefRequest(BaseModel):
     ref_type: str
     ref_id: str
-    image_id: int
-    version_id: int | None = None
+    asset_sha256: Sha256
 
 
 class CreateExternalRefResponse(BaseModel):
-    id: int
+    id: str
 
 
 class ExternalAssetResponse(BaseModel):
-    image_id: int
-    version_id: int
+    sha256: str
     mime: str | None = None
     width: int | None = None
     height: int | None = None

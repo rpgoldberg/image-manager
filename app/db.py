@@ -1,5 +1,6 @@
 import contextlib
 from collections.abc import Generator
+from typing import Any
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -7,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .config import get_settings
 
 _settings = get_settings()
-_engine_kwargs: dict = {
+_engine_kwargs: dict[str, Any] = {
     "pool_pre_ping": True,
     "pool_recycle": _settings.db_pool_recycle,
     "future": True,
@@ -16,7 +17,9 @@ if not _settings.database_url.startswith("sqlite"):
     _engine_kwargs["pool_size"] = _settings.db_pool_size
     _engine_kwargs["max_overflow"] = _settings.db_max_overflow
 engine = create_engine(_settings.database_url, **_engine_kwargs)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+SessionLocal = sessionmaker(
+    bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True
+)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -29,7 +32,9 @@ def get_db() -> Generator[Session, None, None]:
 
 
 @contextlib.contextmanager
-def worker_session(session_factory: sessionmaker | None = None) -> Generator[Session, None, None]:
+def worker_session(
+    session_factory: sessionmaker[Session] | None = None,
+) -> Generator[Session, None, None]:
     """Context manager for worker tasks — commits on success, rolls back on error."""
     factory = session_factory or SessionLocal
     db = factory()
@@ -41,4 +46,3 @@ def worker_session(session_factory: sessionmaker | None = None) -> Generator[Ses
         raise
     finally:
         db.close()
-

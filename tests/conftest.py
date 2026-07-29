@@ -10,38 +10,39 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["JWT_SECRET"] = "test-secret"
 os.environ["ALLOW_DEV_TOKENS"] = "true"
 
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+import datetime as dt  # noqa: E402
+import hashlib  # noqa: E402
+import uuid  # noqa: E402
+from typing import TYPE_CHECKING, Any  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
-import pytest
-from app.auth import create_token
-from app.config import Settings, get_settings
-from app.db import get_db
-from app.main import app
-from app.models import Base
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
-from sqlalchemy.dialects.postgresql import CITEXT, UUID
-from sqlalchemy.ext.compiler import compiles  # noqa: E402
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+import pytest  # noqa: E402
+from app.auth import create_token  # noqa: E402
+from app.config import Settings, get_settings  # noqa: E402
+from app.db import get_db  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import SCHEMA, Asset, AssetOrigin, Base, SourcePolicy  # noqa: E402
+from app.sqlite_compat import install_sqlite_compat  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine, event  # noqa: E402
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Register PostgreSQL type adaptors so SQLite can handle UUID/CITEXT columns
+# Test digests
+#
+# sha256_hex is a real domain now: '\"a\" * 64' is still valid hex but 'ws1' * 22
+# is not, and the ORM type rejects it.  Tests name their bytes instead of
+# hand-rolling digests.
 # ---------------------------------------------------------------------------
 
 
-@compiles(UUID, "sqlite")  # type: ignore[misc]
-def _compile_uuid_sqlite(type_: UUID, compiler: object, **kw: object) -> str:  # type: ignore[no-untyped-def]
-    return "TEXT"
-
-
-@compiles(CITEXT, "sqlite")  # type: ignore[misc]
-def _compile_citext_sqlite(type_: CITEXT, compiler: object, **kw: object) -> str:  # type: ignore[no-untyped-def]
-    return "TEXT"
+def sha(label: str) -> str:
+    """A deterministic, *valid* sha256 digest for a named test fixture."""
+    return hashlib.sha256(label.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ def _compile_citext_sqlite(type_: CITEXT, compiler: object, **kw: object) -> str
 
 
 @pytest.fixture()
-def db_engine():
+def db_engine():  # type: ignore[no-untyped-def]
     engine = create_engine(
         "sqlite://",
         echo=False,
@@ -58,9 +59,14 @@ def db_engine():
         poolclass=StaticPool,
     )
 
-    # SQLite doesn't enforce FK by default
+    # btrim() and friends: the CHECK constraints are written exactly as the
+    # adjudicated PostgreSQL DDL writes them.
+    install_sqlite_compat(engine)
+
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _connection_record):  # type: ignore[no-untyped-def]
+        # The v3 schema lives in the `media` namespace.  SQLite gets one too.
+        dbapi_conn.execute(f"ATTACH DATABASE ':memory:' AS {SCHEMA}")
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
@@ -72,8 +78,10 @@ def db_engine():
 
 
 @pytest.fixture()
-def db_session(db_engine) -> Generator[Session, None, None]:  # type: ignore[type-arg]
-    TestSession = sessionmaker(bind=db_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+def db_session(db_engine) -> Generator[Session, None, None]:  # type: ignore[type-arg,no-untyped-def]
+    TestSession = sessionmaker(
+        bind=db_engine, autoflush=False, autocommit=False, expire_on_commit=False
+    )
     session = TestSession()
     try:
         yield session
@@ -121,12 +129,133 @@ def client(db_session: Session, test_settings: Settings) -> Generator[TestClient
     # Patch Celery tasks to be no-ops so they don't require a broker
     with (
         patch("app.workers.tasks.verify_and_register_object.delay", new=MagicMock()),
-        patch("app.workers.tasks.create_transformed_version.delay", new=MagicMock()),
+        patch("app.workers.tasks.build_rendition.delay", new=MagicMock()),
+        patch("app.workers.tasks.build_presentation_layer.delay", new=MagicMock()),
         patch("app.workers.tasks.generate_album_cover.delay", new=MagicMock()),
     ):
         yield TestClient(app, raise_server_exceptions=False)
 
     app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Media-schema factories
+#
+# Every asset needs at least one origin for the rights story to be auditable,
+# and the render gate reads origins + source_policy, so building those by hand
+# in each test would bury the assertion under setup.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def make_asset(db_session: Session):  # type: ignore[no-untyped-def]
+    """Insert an `asset` row.  Byte facts default to the closed position."""
+
+    def _make(
+        label: str = "asset",
+        *,
+        mime: str = "image/jpeg",
+        watermark_state: str = "unchecked",
+        cmi_present: bool | None = None,
+        content_rating: str = "unknown",
+        derived_from: str | None = None,
+        derived_under_basis: str | None = None,
+        derive_ok_latched: bool = False,
+        **kw: Any,
+    ) -> Asset:
+        asset = Asset(
+            sha256=sha(label),
+            mime=mime,
+            watermark_state=watermark_state,
+            cmi_present=cmi_present,
+            content_rating=content_rating,
+            derived_from=derived_from,
+            derived_under_basis=derived_under_basis,
+            derive_ok_latched=derive_ok_latched,
+            **kw,
+        )
+        db_session.add(asset)
+        db_session.flush()
+        return asset
+
+    return _make
+
+
+@pytest.fixture()
+def make_source(db_session: Session):  # type: ignore[no-untyped-def]
+    """Insert a `source_policy` row.  Defaults deny everything, like the DDL."""
+
+    def _make(
+        site: str = "example.test",
+        *,
+        image_derive_ok: bool = False,
+        image_rehost_ok: bool = False,
+        image_hotlink_ok: bool = False,
+        refreshed_at: dt.datetime | None = None,
+    ) -> SourcePolicy:
+        sp = SourcePolicy(
+            source_id=str(uuid.uuid4()),
+            site=site,
+            image_derive_ok=image_derive_ok,
+            image_rehost_ok=image_rehost_ok,
+            image_hotlink_ok=image_hotlink_ok,
+            refreshed_at=refreshed_at or dt.datetime.now(dt.UTC),
+        )
+        db_session.add(sp)
+        db_session.flush()
+        return sp
+
+    return _make
+
+
+@pytest.fixture()
+def make_origin(db_session: Session):  # type: ignore[no-untyped-def]
+    """Insert an `asset_origin` row."""
+
+    def _make(
+        asset: Asset,
+        *,
+        source: SourcePolicy | None = None,
+        source_url: str | None = None,
+        source_class: str = "unknown",
+        rights_basis: str = "unknown",
+        derive_permitted: bool = False,
+        permission_ref: str | None = None,
+        fetched_at: dt.datetime | None = None,
+    ) -> AssetOrigin:
+        origin = AssetOrigin(
+            asset_sha256=asset.sha256,
+            source_id=source.source_id if source else None,
+            source_url=source_url,
+            source_class=source_class,
+            rights_basis=rights_basis,
+            derive_permitted=derive_permitted,
+            permission_ref=permission_ref,
+            fetched_at=fetched_at or dt.datetime.now(dt.UTC),
+        )
+        db_session.add(origin)
+        db_session.flush()
+        return origin
+
+    return _make
+
+
+@pytest.fixture()
+def owned_asset(db_session: Session, make_asset, make_origin):  # type: ignore[no-untyped-def]
+    """An asset the gate should OPEN: first-party, own work, checked clean."""
+
+    def _make(label: str = "owned", **kw: Any) -> Asset:
+        asset = make_asset(label, watermark_state="clean", cmi_present=False, **kw)
+        make_origin(
+            asset,
+            source_class="user_photo",
+            rights_basis="own_work",
+            derive_permitted=True,
+        )
+        db_session.flush()
+        return asset
+
+    return _make
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +286,7 @@ def service_headers(test_settings: Settings) -> dict[str, str]:
 
 
 @pytest.fixture()
-def make_auth_headers(test_settings: Settings):
+def make_auth_headers(test_settings: Settings) -> Callable[..., dict[str, str]]:
     """Factory to create auth headers with custom claims."""
 
     def _make(

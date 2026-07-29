@@ -1,188 +1,243 @@
-"""Tests for image version creation, visibility, safe-alt, and external refs."""
+"""Tests for what replaced ``ImageVersion``.
 
-from app.models import ExternalRef, Image, ImageVersion
+Its two real jobs split by the question "do we own the input":
+
+* a technical re-encode of bytes we are already rehosting is an
+  :class:`~app.models.AssetRendition` — a cache;
+* an expressive edit is a :class:`~app.models.Presentation` — render layers,
+  no new bytes.
+
+The old ``expose-safe-alt`` endpoint (which baked a *blurred copy* of an image
+whether or not we owned it) is gone: blurring is expressive, so it is a
+presentation layer now and goes through the gate.
+"""
+
+from app.models import AssetRendition, ExternalRef, Presentation
+from tests.conftest import sha
 
 
-class TestCreateVersion:
-    def test_create_version_from_base(self, client, auth_headers, db_session):
-        img = Image(sha256="a1" * 32, bytes=100, mime="image/jpeg", storage_key="k/a1")
-        db_session.add(img)
-        db_session.flush()
-        v1 = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=200, height=200, bytes=100, storage_key="k/a1", visibility="private", age_rating=0,
-        )
-        db_session.add(v1)
+class TestRenditions:
+    def test_create_rendition(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("rend-1")
         db_session.commit()
-
         r = client.post(
-            f"/images/{img.id}/versions",
-            json={"transform_spec": {"resize": {"width": 100}}},
+            f"/assets/{asset.sha256}/renditions",
+            json={"transform": {"resize": {"width": 320}, "format": "webp"}},
             headers=auth_headers,
         )
         assert r.status_code == 200
         data = r.json()
-        assert data["version_no"] == 2
-        assert "storage_key" in data
+        assert data["sha256"] == asset.sha256
+        assert data["storage_key"].startswith("rendition/")
+        assert db_session.get(AssetRendition, (asset.sha256, data["transform_hash"])) is not None
 
-    def test_create_version_explicit_base(self, client, auth_headers, db_session):
-        img = Image(sha256="a2" * 32, bytes=100, mime="image/jpeg", storage_key="k/a2")
-        db_session.add(img)
-        db_session.flush()
-        v1 = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=200, height=200, bytes=100, storage_key="k/a2", visibility="private", age_rating=0,
-        )
-        db_session.add(v1)
+    def test_rendition_is_idempotent_per_transform(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        asset = owned_asset("rend-2")
         db_session.commit()
+        body = {"transform": {"resize": {"width": 320}}}
+        r1 = client.post(f"/assets/{asset.sha256}/renditions", json=body, headers=auth_headers)
+        r2 = client.post(f"/assets/{asset.sha256}/renditions", json=body, headers=auth_headers)
+        assert r1.json()["transform_hash"] == r2.json()["transform_hash"]
+        assert r1.json()["storage_key"] == r2.json()["storage_key"]
 
+    def test_expressive_transform_is_refused(self, client, auth_headers, owned_asset, db_session):
+        """If a crop appears here the cache has become a derivative-work
+        factory."""
+        asset = owned_asset("rend-3")
+        db_session.commit()
         r = client.post(
-            f"/images/{img.id}/versions",
-            json={"transform_spec": {"blur": {"sigma": 5}}, "base_version_id": v1.id},
+            f"/assets/{asset.sha256}/renditions",
+            json={"transform": {"crop": {"x": 0, "y": 0, "width": 10, "height": 10}}},
+            headers=auth_headers,
+        )
+        assert r.status_code == 422
+
+    def test_rendition_on_missing_asset_404(self, client, auth_headers):
+        r = client.post(
+            f"/assets/{sha('nope')}/renditions",
+            json={"transform": {"resize": {"width": 10}}},
+            headers=auth_headers,
+        )
+        assert r.status_code == 404
+
+
+class TestPresentations:
+    def test_create_presentation_when_gate_open(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        asset = owned_asset("pres-1")
+        db_session.commit()
+        r = client.post(
+            f"/assets/{asset.sha256}/presentations",
+            json={
+                "layer_type": "depth_transform",
+                "produced_by": "caseshelf:v1",
+                "render_context": "case_shelf",
+                "transform": {"rotateX": 8},
+            },
             headers=auth_headers,
         )
         assert r.status_code == 200
-        assert r.json()["version_no"] == 2
+        assert db_session.get(Presentation, r.json()["id"]) is not None
 
-    def test_create_version_no_base_400(self, client, auth_headers, db_session):
-        img = Image(sha256="a3" * 32, bytes=100, mime="image/jpeg", storage_key="k/a3")
-        db_session.add(img)
+    def test_presentation_refused_when_gate_closed(
+        self, client, auth_headers, make_asset, make_origin, db_session
+    ):
+        """A matte mask cannot exist over a photograph whose derivation was
+        never permitted."""
+        asset = make_asset("pres-closed", watermark_state="unchecked", cmi_present=False)
+        make_origin(
+            asset, source_class="user_photo", rights_basis="own_work", derive_permitted=True
+        )
         db_session.commit()
-        # No versions exist
         r = client.post(
-            f"/images/{img.id}/versions",
-            json={"transform_spec": {}},
+            f"/assets/{asset.sha256}/presentations",
+            json={"layer_type": "depth_transform", "produced_by": "caseshelf:v1", "transform": {}},
             headers=auth_headers,
         )
-        assert r.status_code == 400
+        assert r.status_code == 403
+        assert "watermark" in r.json()["detail"].lower()
 
-
-class TestSetVisibility:
-    def test_set_visibility(self, client, auth_headers, db_session):
-        img = Image(sha256="b1" * 32, bytes=100, mime="image/jpeg", storage_key="k/b1")
-        db_session.add(img)
-        db_session.flush()
-        v = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=100, height=100, bytes=100, storage_key="k/b1", visibility="private", age_rating=0,
-        )
-        db_session.add(v)
+    def test_disable_presentation_is_the_kill_switch(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        asset = owned_asset("pres-kill")
         db_session.commit()
+        created = client.post(
+            f"/assets/{asset.sha256}/presentations",
+            json={"layer_type": "depth_transform", "produced_by": "caseshelf:v1", "transform": {}},
+            headers=auth_headers,
+        ).json()
 
         r = client.post(
-            f"/images/{img.id}/versions/{v.id}/visibility",
-            json={"visibility": "public"},
+            f"/assets/{asset.sha256}/presentations/{created['id']}/disable",
+            json={"reason": "DMCA takedown 41"},
             headers=auth_headers,
         )
         assert r.status_code == 200
-        db_session.refresh(v)
-        assert v.visibility == "public"
+        db_session.expire_all()
+        layer = db_session.get(Presentation, created["id"])
+        assert layer.enabled is False
+        assert layer.disabled_at is not None
+        assert layer.disabled_reason == "DMCA takedown 41"
 
-    def test_set_visibility_404_wrong_image(self, client, auth_headers, db_session):
-        img = Image(sha256="b2" * 32, bytes=100, mime="image/jpeg", storage_key="k/b2")
-        db_session.add(img)
-        db_session.flush()
-        v = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=100, height=100, bytes=100, storage_key="k/b2", visibility="private", age_rating=0,
-        )
-        db_session.add(v)
+    def test_disable_requires_a_reason(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("pres-noreason")
         db_session.commit()
-
-        # Wrong image_id
+        created = client.post(
+            f"/assets/{asset.sha256}/presentations",
+            json={"layer_type": "depth_transform", "produced_by": "caseshelf:v1", "transform": {}},
+            headers=auth_headers,
+        ).json()
         r = client.post(
-            f"/images/99999/versions/{v.id}/visibility",
+            f"/assets/{asset.sha256}/presentations/{created['id']}/disable",
+            json={"reason": ""},
+            headers=auth_headers,
+        )
+        assert r.status_code == 422
+
+    def test_disable_wrong_asset_404(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("pres-wrong")
+        other = owned_asset("pres-other")
+        db_session.commit()
+        created = client.post(
+            f"/assets/{asset.sha256}/presentations",
+            json={"layer_type": "depth_transform", "produced_by": "x:v1", "transform": {}},
+            headers=auth_headers,
+        ).json()
+        r = client.post(
+            f"/assets/{other.sha256}/presentations/{created['id']}/disable",
+            json={"reason": "wrong asset"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 404
+
+
+class TestVisibility:
+    def test_set_visibility_on_the_grant(self, client, auth_headers, db_session):
+        """Visibility is a property of the grant, not of a rendering."""
+        digest = sha("vis-1")
+        client.post(
+            "/assets/complete",
+            json={"sha256": digest, "key": "uploads/k", "mime": "image/jpeg", "size": 10},
+            headers=auth_headers,
+        )
+        r = client.post(
+            f"/assets/{digest}/visibility", json={"visibility": "public"}, headers=auth_headers
+        )
+        assert r.status_code == 200
+
+        from app.models import UserAssetLink
+
+        db_session.expire_all()
+        link = db_session.query(UserAssetLink).filter_by(asset_sha256=digest).first()
+        assert link.visibility == "public"
+
+    def test_set_visibility_without_a_grant_404(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        asset = owned_asset("vis-nogrant")
+        db_session.commit()
+        r = client.post(
+            f"/assets/{asset.sha256}/visibility",
             json={"visibility": "public"},
             headers=auth_headers,
         )
         assert r.status_code == 404
 
 
-class TestExposeSafeAlt:
-    def test_expose_safe_alt(self, client, auth_headers, db_session):
-        img = Image(sha256="c1" * 32, bytes=100, mime="image/jpeg", storage_key="k/c1")
-        db_session.add(img)
-        db_session.flush()
-        v = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=100, height=100, bytes=100, storage_key="k/c1", visibility="private", age_rating=18,
-        )
-        db_session.add(v)
-        db_session.commit()
-
-        r = client.post(
-            f"/images/{img.id}/versions/{v.id}/expose-safe-alt",
-            json={"age_rating": 0},
-            headers=auth_headers,
-        )
-        assert r.status_code == 200
-        data = r.json()
-        assert data["alt_for"] == v.id
-        assert "version_id" in data
-
-
 class TestExternalRefs:
-    def test_create_and_lookup(self, client, auth_headers, db_session):
-        img = Image(sha256="d1" * 32, bytes=100, mime="image/jpeg", storage_key="k/d1")
-        db_session.add(img)
-        db_session.flush()
-        v = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=200, height=200, bytes=100, storage_key="k/d1", visibility="public", age_rating=0,
-        )
-        db_session.add(v)
+    def test_create_and_lookup(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("ext-1")
         db_session.commit()
-
-        # Create ref
         r = client.post(
             "/external/refs",
-            json={"ref_type": "post", "ref_id": "post-42", "image_id": img.id, "version_id": v.id},
+            json={"ref_type": "post", "ref_id": "post-42", "asset_sha256": asset.sha256},
             headers=auth_headers,
         )
         assert r.status_code == 200
-        assert "id" in r.json()
+        assert db_session.get(ExternalRef, r.json()["id"]) is not None
 
-        # Lookup
         r = client.get(
-            "/external/assets/by-external-ref?ref_type=post&ref_id=post-42",
-            headers=auth_headers,
+            "/external/assets/by-external-ref?ref_type=post&ref_id=post-42", headers=auth_headers
         )
         assert r.status_code == 200
         data = r.json()
-        assert data["image_id"] == img.id
-        assert data["version_id"] == v.id
+        assert data["sha256"] == asset.sha256
         assert "url" in data
 
     def test_lookup_missing_ref_404(self, client, auth_headers):
         r = client.get(
-            "/external/assets/by-external-ref?ref_type=nope&ref_id=nope",
+            "/external/assets/by-external-ref?ref_type=nope&ref_id=nope", headers=auth_headers
+        )
+        assert r.status_code == 404
+
+    def test_ref_to_unknown_asset_404(self, client, auth_headers):
+        r = client.post(
+            "/external/refs",
+            json={"ref_type": "post", "ref_id": "ghost", "asset_sha256": sha("ghost")},
             headers=auth_headers,
         )
         assert r.status_code == 404
 
-    def test_create_ref_without_version(self, client, auth_headers, db_session):
-        img = Image(sha256="d2" * 32, bytes=100, mime="image/jpeg", storage_key="k/d2")
-        db_session.add(img)
-        db_session.flush()
-        v = ImageVersion(
-            image_id=img.id, version_no=1, transform_spec={}, mime="image/jpeg",
-            width=200, height=200, bytes=100, storage_key="k/d2", visibility="public", age_rating=0,
+    def test_suppressed_asset_is_not_reachable_by_ref(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        from app.rights import suppress_asset
+
+        asset = owned_asset("ext-suppressed")
+        db_session.commit()
+        client.post(
+            "/external/refs",
+            json={"ref_type": "post", "ref_id": "post-99", "asset_sha256": asset.sha256},
+            headers=auth_headers,
         )
-        db_session.add(v)
+        suppress_asset(db_session, asset.sha256, reason="DMCA 7", actor="legal")
         db_session.commit()
 
-        # Create ref without specifying version_id
-        r = client.post(
-            "/external/refs",
-            json={"ref_type": "comment", "ref_id": "c-1", "image_id": img.id},
-            headers=auth_headers,
-        )
-        assert r.status_code == 200
-
-        # Lookup should still work (falls back to first version)
         r = client.get(
-            "/external/assets/by-external-ref?ref_type=comment&ref_id=c-1",
-            headers=auth_headers,
+            "/external/assets/by-external-ref?ref_type=post&ref_id=post-99", headers=auth_headers
         )
-        assert r.status_code == 200
-        assert r.json()["version_id"] == v.id
+        assert r.status_code == 404

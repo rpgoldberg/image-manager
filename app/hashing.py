@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import io
-from typing import BinaryIO, Tuple
+from typing import BinaryIO
 
-from PIL import Image
 from imagehash import phash
+from PIL import Image
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -28,7 +28,6 @@ def compute_phash(data: bytes) -> str:
     return str(hash_val)
 
 
-def get_image_dimensions(data: bytes) -> Tuple[int, int]:
+def get_image_dimensions(data: bytes) -> tuple[int, int]:
     img = Image.open(io.BytesIO(data))
     return img.width, img.height
-

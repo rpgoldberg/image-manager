@@ -1,40 +1,65 @@
+"""Access policy: who may SEE an asset.
+
+Distinct from :mod:`app.rights`, which decides what we may DO to it.  v1
+conflated them by hanging ``visibility`` off ``ImageVersion`` — rights are a
+property of where the bytes came from, not of a rendering of them.  Here
+visibility lives on the grant (``user_asset_link``) or the album item, and age
+rating lives on the bytes (``asset.content_rating``).
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+
+from .models import rating_rank
 
 
 @dataclass
 class AuthCtx:
     subject: str
-    tenant_id: Optional[str]
+    tenant_id: str | None
     is_service: bool
     scopes: list[str]
     safe_mode: bool = False
 
 
-def can_view_version(ctx: AuthCtx | None, version_visibility: str, owner_tenant_id: Optional[str], version_age: int, share_threshold: Optional[int] = None) -> bool:
-    # Public visible to anyone
-    if version_visibility == "public":
-        return True
-    # Catalog requires service token scope
-    if version_visibility == "catalog":
-        return bool(ctx and ctx.is_service and ("assets:read" in ctx.scopes))
-    # Tenant visibility requires matching tenant
-    if version_visibility == "tenant":
-        if ctx and ctx.tenant_id and owner_tenant_id and ctx.tenant_id == owner_tenant_id:
-            pass
-        else:
-            return False
-    # private requires a link which is enforced at query time
+def can_view(
+    ctx: AuthCtx | None,
+    visibility: str,
+    owner_tenant_id: str | None = None,
+    content_rating: str = "unknown",
+    share_threshold: str | None = None,
+) -> bool:
+    """Visibility first, then the age gate.
 
-    # Age gating with safe mode or share threshold
-    threshold = 0
-    if ctx and ctx.safe_mode:
-        threshold = max(threshold, 1)
-    if share_threshold is not None:
-        threshold = max(threshold, share_threshold)
-    if version_age > threshold:
+    ``content_rating`` and ``share_threshold`` are both
+    :data:`~app.models.CONTENT_RATING_VALUES` members now, so they are
+    comparable again: v1 stored an integer age on the *version* and an integer
+    threshold on the album, and the restructure would have left the two
+    unrelated.
+
+    The age gate applies only in a gated context — a share link, or a caller
+    asking for safe mode.  ``unknown`` ranks MOST restrictive, so an unrated
+    asset is withheld from both rather than leaking on the default.
+    """
+    if visibility == "public":
+        allowed = True
+    elif visibility == "catalog":
+        # Catalog requires a service token scope.
+        allowed = bool(ctx and ctx.is_service and ("assets:read" in ctx.scopes))
+    elif visibility == "tenant":
+        allowed = bool(
+            ctx and ctx.tenant_id and owner_tenant_id and ctx.tenant_id == owner_tenant_id
+        )
+    else:
+        # private: requires a grant, which is enforced at query time.
+        allowed = True
+
+    if not allowed:
         return False
-    return True
 
+    if share_threshold is not None:
+        return rating_rank(content_rating) <= rating_rank(share_threshold)
+    if ctx is not None and ctx.safe_mode:
+        return rating_rank(content_rating) <= rating_rank("all_ages")
+    return True

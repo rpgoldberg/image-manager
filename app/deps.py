@@ -30,10 +30,14 @@ def get_auth_ctx(request: Request) -> AuthCtx | None:
     ten = payload.get("ten")
     scopes = payload.get("scopes") or []
     is_service = sub.startswith("service:")
-    return AuthCtx(subject=sub, tenant_id=ten, is_service=is_service, scopes=list(scopes), safe_mode=safe_mode)
+    return AuthCtx(
+        subject=sub, tenant_id=ten, is_service=is_service, scopes=list(scopes), safe_mode=safe_mode
+    )
 
 
 def require_auth_ctx(ctx: AuthCtx | None = Depends(get_auth_ctx)) -> AuthCtx:  # noqa: B008
     if ctx is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
     return ctx

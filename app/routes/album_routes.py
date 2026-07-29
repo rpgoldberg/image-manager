@@ -1,20 +1,29 @@
+"""Album routes.  Album items key on ``asset.sha256``.
+
+``album_item`` now has its own surrogate id: v1's PK was
+``(album_id, position)``, so reordering an album was a primary-key update
+cascade.
+"""
+
+from __future__ import annotations
+
 import datetime as dt
 import hashlib
 import secrets
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import require_auth_ctx
-from ..models import Album, AlbumItem
-from ..policy import AuthCtx
+from ..models import Album, AlbumItem, Asset
 from ..schemas import (
     AddAlbumItemRequest,
     AddAlbumItemResponse,
     AlbumCoverResponse,
     AlbumDetailResponse,
+    AlbumItemSummary,
     CreateAlbumRequest,
     CreateAlbumResponse,
     OkResponse,
@@ -24,6 +33,11 @@ from ..schemas import (
     UpdateAlbumRequest,
 )
 from ..workers.tasks import enqueue_album_cover
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from ..policy import AuthCtx
 
 router = APIRouter(prefix="/albums", tags=["albums"])
 
@@ -50,7 +64,7 @@ def create_album(
 
 @router.put("/{album_id}", response_model=OkResponse)
 def update_album(
-    album_id: int,
+    album_id: str,
     payload: UpdateAlbumRequest,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
@@ -67,7 +81,7 @@ def update_album(
 
 @router.post("/{album_id}/items", response_model=AddAlbumItemResponse)
 def add_item(
-    album_id: int,
+    album_id: str,
     payload: AddAlbumItemRequest,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
@@ -75,16 +89,15 @@ def add_item(
     album = db.get(Album, album_id)
     if not album:
         raise HTTPException(status_code=404, detail="not found")
+    if db.get(Asset, payload.asset_sha256) is None:
+        raise HTTPException(status_code=404, detail="asset not found")
     position = payload.position
     if position is None:
-        cnt = db.execute(select(AlbumItem).where(AlbumItem.album_id == album_id)).scalars().all()
-        position = len(cnt)
-    item = AlbumItem(
-        album_id=album_id,
-        position=position,
-        image_id=payload.image_id,
-        version_id=payload.version_id,
-    )
+        existing = (
+            db.execute(select(AlbumItem).where(AlbumItem.album_id == album_id)).scalars().all()
+        )
+        position = len(existing)
+    item = AlbumItem(album_id=album_id, position=position, asset_sha256=payload.asset_sha256)
     db.add(item)
     db.commit()
     return AddAlbumItemResponse(position=item.position)
@@ -92,29 +105,39 @@ def add_item(
 
 @router.put("/{album_id}/items/reorder", response_model=OkResponse)
 def reorder(
-    album_id: int,
+    album_id: str,
     payload: ReorderRequest,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> OkResponse:
-    for it in payload.items:
-        item = db.get(AlbumItem, {"album_id": album_id, "position": it.from_position})
+    for move in payload.items:
+        item = db.execute(
+            select(AlbumItem).where(
+                AlbumItem.album_id == album_id, AlbumItem.position == move.from_position
+            )
+        ).scalar_one_or_none()
         if item:
-            item.position = it.to_position
+            item.position = move.to_position
     db.commit()
     return OkResponse(ok=True)
 
 
 @router.get("/{album_id}", response_model=AlbumDetailResponse)
 def get_album(
-    album_id: int,
+    album_id: str,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> AlbumDetailResponse:
     album = db.get(Album, album_id)
     if not album or album.deleted_at is not None:
         raise HTTPException(status_code=404, detail="not found")
-    items = db.execute(select(AlbumItem).where(AlbumItem.album_id == album_id).order_by(AlbumItem.position)).scalars().all()
+    items = (
+        db.execute(
+            select(AlbumItem).where(AlbumItem.album_id == album_id).order_by(AlbumItem.position)
+        )
+        .scalars()
+        .all()
+    )
     return AlbumDetailResponse(
         id=album.id,
         title=album.title,
@@ -123,7 +146,11 @@ def get_album(
         is_shareable=album.is_shareable,
         share_age_threshold=album.share_age_threshold,
         items=[
-            {"position": it.position, "image_id": it.image_id, "version_id": it.version_id}
+            AlbumItemSummary(
+                position=it.position,
+                asset_sha256=it.asset_sha256,
+                item_visibility=it.item_visibility,
+            )
             for it in items
         ],
     )
@@ -131,7 +158,7 @@ def get_album(
 
 @router.post("/{album_id}/share", response_model=ShareAlbumResponse)
 def share_album(
-    album_id: int,
+    album_id: str,
     payload: ShareAlbumRequest,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
@@ -145,33 +172,30 @@ def share_album(
         if payload.share_age_threshold is not None:
             album.share_age_threshold = payload.share_age_threshold
         db.commit()
-        url = f"/p/albums/{token}"
-        return ShareAlbumResponse(share_url=url)
-    else:
-        album.share_token_hash = None
-        db.commit()
-        return ShareAlbumResponse(share_url=None)
+        return ShareAlbumResponse(share_url=f"/p/albums/{token}")
+    album.share_token_hash = None
+    db.commit()
+    return ShareAlbumResponse(share_url=None)
 
 
 @router.get("/cover/{album_id}", response_model=AlbumCoverResponse)
 def album_cover(
-    album_id: int,
+    album_id: str,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> AlbumCoverResponse:
-    key = enqueue_album_cover(album_id)
-    return AlbumCoverResponse(storage_key=key)
+    return AlbumCoverResponse(storage_key=enqueue_album_cover(album_id))
 
 
 @router.delete("/{album_id}", response_model=OkResponse)
 def delete_album(
-    album_id: int,
+    album_id: str,
     db: Session = Depends(get_db),  # noqa: B008
     ctx: AuthCtx = Depends(require_auth_ctx),  # noqa: B008
 ) -> OkResponse:
     album = db.get(Album, album_id)
     if not album or album.deleted_at is not None:
         raise HTTPException(status_code=404, detail="not found")
-    album.deleted_at = dt.datetime.now(dt.timezone.utc)
+    album.deleted_at = dt.datetime.now(dt.UTC)
     db.commit()
     return OkResponse(ok=True)

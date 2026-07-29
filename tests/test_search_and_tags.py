@@ -1,11 +1,17 @@
-"""Tests for search endpoints and tag management."""
+"""Tests for search endpoints and tag management.
 
-from app.models import Album, Image, Tag
+Tags key on ``asset.sha256``; tag names are matched case-insensitively via the
+``lower(name)`` functional index rather than a CITEXT column.
+"""
+
+from app.models import Album, Tag
 
 
 class TestCreateTag:
     def test_create_global_tag(self, client, auth_headers):
-        r = client.post("/tags", json={"name": "landscape", "scope": "global"}, headers=auth_headers)
+        r = client.post(
+            "/tags", json={"name": "landscape", "scope": "global"}, headers=auth_headers
+        )
         assert r.status_code == 200
         data = r.json()
         assert data["name"] == "landscape"
@@ -14,50 +20,71 @@ class TestCreateTag:
     def test_create_tenant_tag(self, client, auth_headers):
         r = client.post(
             "/tags",
-            json={"name": "internal", "scope": "tenant", "tenant_id": "11111111-2222-3333-4444-555555555555"},
+            json={
+                "name": "internal",
+                "scope": "tenant",
+                "tenant_id": "11111111-2222-3333-4444-555555555555",
+            },
             headers=auth_headers,
         )
         assert r.status_code == 200
 
 
-class TestTagImage:
-    def test_tag_image_by_id(self, client, auth_headers, db_session):
-        img = Image(sha256="aa" * 32, bytes=50, mime="image/jpeg", storage_key="k/aa")
+class TestTagAsset:
+    def test_tag_asset_by_id(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("tag-1")
         tag = Tag(name="sunset", scope="global")
-        db_session.add_all([img, tag])
+        db_session.add(tag)
         db_session.commit()
 
         r = client.post(
-            f"/tags/images/{img.id}",
-            json={"tag_ids": [tag.id]},
-            headers=auth_headers,
+            f"/tags/assets/{asset.sha256}", json={"tag_ids": [tag.id]}, headers=auth_headers
         )
         assert r.status_code == 200
         assert r.json()["count"] == 1
 
-    def test_tag_image_by_name(self, client, auth_headers, db_session):
-        img = Image(sha256="bb" * 32, bytes=50, mime="image/jpeg", storage_key="k/bb")
+    def test_tag_asset_by_name(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("tag-2")
         tag = Tag(name="nature", scope="global")
-        db_session.add_all([img, tag])
+        db_session.add(tag)
         db_session.commit()
 
         r = client.post(
-            f"/tags/images/{img.id}",
+            f"/tags/assets/{asset.sha256}",
             json={"tag_ids": [], "names": ["nature"]},
             headers=auth_headers,
         )
         assert r.status_code == 200
         assert r.json()["count"] == 1
 
-    def test_tag_image_deduplicates(self, client, auth_headers, db_session):
-        img = Image(sha256="cc" * 32, bytes=50, mime="image/jpeg", storage_key="k/cc")
-        tag = Tag(name="dup", scope="global")
-        db_session.add_all([img, tag])
+    def test_tag_name_match_is_case_insensitive(
+        self, client, auth_headers, owned_asset, db_session
+    ):
+        """v1 leaned on a CITEXT column; the DDL uses a lower(name) index."""
+        asset = owned_asset("tag-ci")
+        db_session.add(Tag(name="Seaside", scope="global"))
         db_session.commit()
 
-        # Tag twice
-        client.post(f"/tags/images/{img.id}", json={"tag_ids": [tag.id]}, headers=auth_headers)
-        r = client.post(f"/tags/images/{img.id}", json={"tag_ids": [tag.id]}, headers=auth_headers)
+        r = client.post(
+            f"/tags/assets/{asset.sha256}",
+            json={"tag_ids": [], "names": ["SEASIDE"]},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        assert r.json()["count"] == 1
+
+    def test_tag_asset_deduplicates(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("tag-3")
+        tag = Tag(name="dup", scope="global")
+        db_session.add(tag)
+        db_session.commit()
+
+        client.post(
+            f"/tags/assets/{asset.sha256}", json={"tag_ids": [tag.id]}, headers=auth_headers
+        )
+        r = client.post(
+            f"/tags/assets/{asset.sha256}", json={"tag_ids": [tag.id]}, headers=auth_headers
+        )
         assert r.status_code == 200
 
 
@@ -69,50 +96,44 @@ class TestTagAlbum:
         db_session.commit()
 
         r = client.post(
-            f"/tags/albums/{album.id}",
-            json={"tag_ids": [tag.id]},
-            headers=auth_headers,
+            f"/tags/albums/{album.id}", json={"tag_ids": [tag.id]}, headers=auth_headers
         )
         assert r.status_code == 200
         assert r.json()["count"] == 1
 
 
-class TestSearchImages:
-    def test_search_by_mime(self, client, auth_headers, db_session):
-        img = Image(sha256="dd" * 32, bytes=50, mime="image/png", storage_key="k/dd")
-        db_session.add(img)
+class TestSearchAssets:
+    def test_search_by_mime(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("srch-1", mime="image/png")
         db_session.commit()
 
-        r = client.get("/search/images?query=png", headers=auth_headers)
+        r = client.get("/search/assets?query=png", headers=auth_headers)
         assert r.status_code == 200
-        results = r.json()["results"]
-        assert any(row["id"] == img.id for row in results)
+        assert any(row["sha256"] == asset.sha256 for row in r.json()["results"])
 
     def test_search_no_results(self, client, auth_headers):
-        r = client.get("/search/images?query=nonexistent_xyz", headers=auth_headers)
+        r = client.get("/search/assets?query=nonexistent_xyz", headers=auth_headers)
         assert r.status_code == 200
         assert r.json()["results"] == []
 
-    def test_search_by_tags(self, client, auth_headers, db_session):
-        img = Image(sha256="ee" * 32, bytes=50, mime="image/jpeg", storage_key="k/ee")
+    def test_search_by_tags(self, client, auth_headers, owned_asset, db_session):
+        asset = owned_asset("srch-2")
         tag = Tag(name="searchable", scope="global")
-        db_session.add_all([img, tag])
+        db_session.add(tag)
         db_session.commit()
+        client.post(
+            f"/tags/assets/{asset.sha256}", json={"tag_ids": [tag.id]}, headers=auth_headers
+        )
 
-        # Tag the image
-        client.post(f"/tags/images/{img.id}", json={"tag_ids": [tag.id]}, headers=auth_headers)
-
-        r = client.get("/search/images?tags=searchable", headers=auth_headers)
+        r = client.get("/search/assets?tags=searchable", headers=auth_headers)
         assert r.status_code == 200
-        results = r.json()["results"]
-        assert any(row["id"] == img.id for row in results)
+        assert any(row["sha256"] == asset.sha256 for row in r.json()["results"])
 
-    def test_search_returns_all_when_no_filter(self, client, auth_headers, db_session):
-        img = Image(sha256="ff" * 32, bytes=50, mime="image/jpeg", storage_key="k/ff")
-        db_session.add(img)
+    def test_search_returns_all_when_no_filter(self, client, auth_headers, owned_asset, db_session):
+        owned_asset("srch-3")
         db_session.commit()
 
-        r = client.get("/search/images", headers=auth_headers)
+        r = client.get("/search/assets", headers=auth_headers)
         assert r.status_code == 200
         assert len(r.json()["results"]) >= 1
 
@@ -125,8 +146,7 @@ class TestSearchAlbums:
 
         r = client.get("/search/albums?query=Summer", headers=auth_headers)
         assert r.status_code == 200
-        results = r.json()["results"]
-        assert any(row["id"] == album.id for row in results)
+        assert any(row["id"] == album.id for row in r.json()["results"])
 
     def test_search_by_description(self, client, auth_headers, db_session):
         album = Album(title="X", description="Beach photos from Hawaii")
@@ -135,8 +155,7 @@ class TestSearchAlbums:
 
         r = client.get("/search/albums?query=Hawaii", headers=auth_headers)
         assert r.status_code == 200
-        results = r.json()["results"]
-        assert any(row["id"] == album.id for row in results)
+        assert any(row["id"] == album.id for row in r.json()["results"])
 
     def test_search_albums_by_tags(self, client, auth_headers, db_session):
         album = Album(title="Tagged")
@@ -148,5 +167,4 @@ class TestSearchAlbums:
 
         r = client.get("/search/albums?tags=album_tag", headers=auth_headers)
         assert r.status_code == 200
-        results = r.json()["results"]
-        assert any(row["id"] == album.id for row in results)
+        assert any(row["id"] == album.id for row in r.json()["results"])
